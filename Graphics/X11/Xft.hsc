@@ -26,8 +26,11 @@ module Graphics.X11.Xft ( XftColor
                         , xftDrawDestroy
                         , XftFont
                         , xftfont_ascent
+                        , xftfont_ascent'
                         , xftfont_descent
+                        , xftfont_descent'
                         , xftfont_height
+                        , xftfont_height'
                         , xftfont_max_advance_width
                         , xftFontOpen
                         , xftFontOpenXlfd
@@ -37,7 +40,9 @@ module Graphics.X11.Xft ( XftColor
                         , xftFontClose
                         , xftDrawGlyphs
                         , xftDrawString
+                        , xftDrawString'
                         , xftTextExtents
+                        , xftTextExtents'
                         , xftDrawRect
                         , xftDrawSetClipRectangles
                         , xftDrawSetSubwindowMode
@@ -54,6 +59,7 @@ import Control.Monad (void)
 import Foreign hiding (void)
 import Foreign.C.String
 import Foreign.C.Types
+import qualified Data.Char
 
 #include <X11/Xft/Xft.h>
 
@@ -182,11 +188,31 @@ foreign import ccall "XftFontCopy"
 foreign import ccall "XftFontClose"
   xftFontClose :: Display -> XftFont -> IO ()
 
+-- Support for multiple fonts --
+
+xftfont_ascent' :: [XftFont] -> IO Int
+xftfont_ascent' = (fmap maximum) . (mapM xftfont_ascent)
+
+xftfont_descent' :: [XftFont] -> IO Int
+xftfont_descent' = (fmap maximum) . (mapM xftfont_descent)
+
+xftfont_height' :: [XftFont] -> IO Int
+xftfont_height' = (fmap maximum) . (mapM xftfont_height)
+
 ---------------------
 -- Painting
 ---------------------
 
 -- Drawing strings or glyphs --
+
+foreign import ccall "XftCharExists"
+  cXftCharExists :: Display -> XftFont -> (#type FcChar32) -> IO (#type FcBool)
+
+xftCharExists :: Display -> XftFont -> Char -> IO Bool
+xftCharExists d f c = bool `fmap` cXftCharExists d f (fi $ Data.Char.ord c)
+  where
+    bool 0 = False
+    bool _ = True
 
 foreign import ccall "XftDrawGlyphs"
   cXftDrawGlyphs :: XftDraw -> XftColor -> XftFont -> CInt -> CInt -> Ptr (#type FT_UInt) -> CInt -> IO ()
@@ -218,6 +244,69 @@ xftTextExtents d f string =
     \cglyph -> do
       cXftTextExtentsUtf8 d f str_ptr (fi len) cglyph
       peek cglyph
+
+-- Support for multiple fonts --
+
+xftDrawString' :: XftDraw ->
+                  XftColor ->
+                  [XftFont] ->
+                  Integer ->
+                  Integer ->
+                  String -> IO ()
+xftDrawString' d c fs x y string = do
+    display <- xftDrawDisplay d
+    chunks <- getChunks display fs string
+    mapM_ (\(f, s, _, xo, yo) -> xftDrawString d c f (x+xo) (y+yo) s) chunks
+
+
+xftTextExtents' :: Display -> [XftFont] -> String -> IO XGlyphInfo
+xftTextExtents' d fs string = do
+    chunks <- getChunks d fs string
+    let (_, _, gi, _, _) = last chunks
+    return gi
+
+-- Split string and determine fonts/offsets for individual parts
+getChunks :: Display -> [XftFont] -> String ->
+             IO [(XftFont, String, XGlyphInfo, Integer, Integer)]
+getChunks disp fts str = do
+    chunks <- getFonts disp fts str
+    getOffsets (XGlyphInfo 0 0 0 0 0 0) chunks
+  where
+    -- Split string and determine fonts for individual parts
+    getFonts _ [] _ = return []
+    -- FIXME: When string is empty xftTextExtents' crashes(and
+    -- maybe some other functions) because of empty list of chunks
+    -- they get. Empty font lists are excluded by the above hand, so
+    -- we can take any(beacuse string is empty anyway).
+    getFonts _ (ft:_) s@[] = return [(ft, s)]
+    getFonts _ [ft] s = return [(ft, s)]
+    getFonts d fonts@(ft:_) s = do
+        -- Determine which glyph can be rendered by current font
+        glyphs <- mapM (xftCharExists d ft) s
+        -- Split string into parts that can/cannot be rendered
+        let splits = split (runs glyphs) s
+        -- Determine which font to render each chunk with
+        concat `fmap` mapM (getFont d fonts) splits
+
+    -- Determine fonts for substrings
+    getFont _ [] _ = return []
+    getFont _ [ft] (_, s) = return [(ft, s)] -- Last font, use it
+    getFont _ (ft:_) (True, s) = return [(ft, s)] -- Current font can render this substring
+    getFont d (_:fs) (False, s) = getFonts d fs s -- Fallback to next font
+
+    -- Helpers
+    runs [] = []
+    runs (x:xs) = let (h, t) = span (==x) xs in (x, length h + 1) : runs t
+    split [] _ = []
+    split ((x, c):xs) s = let (h, t) = splitAt c s in (x, h) : split xs t
+
+    -- Determine coordinates for chunks using extents
+    getOffsets _ [] = return []
+    getOffsets (XGlyphInfo _ _ x y xo yo) ((f, s):chunks) = do
+        (XGlyphInfo w' h' _ _ xo' yo') <- xftTextExtents disp f s
+        let gi = XGlyphInfo (xo+w') (yo+h') x y (xo+xo') (yo+yo')
+        rest <- getOffsets gi chunks
+        return $ (f, s, gi, fromIntegral xo, fromIntegral yo) : rest
 
 -- Drawing auxilary --
 
